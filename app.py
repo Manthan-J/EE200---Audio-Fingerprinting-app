@@ -5,50 +5,127 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import sqlite3
-from  pathlib import Path
+import shutil
+from pathlib import Path
 import pandas as pd
-#importing all the required functions from the fingerprint script
+from huggingface_hub import snapshot_download, HfApi
+
+# -------------------------------------------------------------------------
+# 1. HUGGING FACE DATASET PERSISTENCE CONFIGURATION
+# -------------------------------------------------------------------------
+# Replace with your actual repository details
+REPO_ID = "Manthan-J/EE200_Project_Song_Database" 
+
+# Read the secure Write Token from Space Secrets
+HF_TOKEN = os.environ.get("HF_TOKEN")
+
+# Define local persistent working directory paths inside the Space
+target_folder = "working_audio_folder"
+db_name_default = "working_database.db"
+
+# Initialize HfApi client if token is available
+api = HfApi(token=HF_TOKEN) if HF_TOKEN else None
+
+@st.cache_resource
+def initialize_data_from_hf():
+    """Downloads baseline data from the HF Dataset on initial startup."""
+    print("Downloading baseline data from Hugging Face Dataset...")
+    dataset_dir = snapshot_download(repo_id=REPO_ID, repo_type="dataset", token=HF_TOKEN)
+    
+    # Copy the DB to writable workspace
+    cached_db_path = os.path.join(dataset_dir, "song_database.db")
+    if os.path.exists(cached_db_path):
+        shutil.copy2(cached_db_path, db_name_default)
+    
+    # Copy the audio files to writable workspace
+    # Check if your dataset has a subfolder, otherwise fall back to top-level directory
+    cached_audio_folder = os.path.join(dataset_dir, "EE200 Project Song Database")
+    if os.path.exists(cached_audio_folder):
+        shutil.copytree(cached_audio_folder, target_folder, dirs_exist_ok=True)
+    else:
+        # If songs are loose in the main repository directory
+        os.makedirs(target_folder, exist_ok=True)
+        for item in os.listdir(dataset_dir):
+            item_path = os.path.join(dataset_dir, item)
+            if os.path.isfile(item_path) and item.endswith(('.mp3', '.wav', '.flac')):
+                shutil.copy2(item_path, os.path.join(target_folder, item))
+
+# Run the initialization on startup
+initialize_data_from_hf()
+
+
+# -------------------------------------------------------------------------
+# 2. APPLICATION IMPORTS & CONFIGURATION
+# -------------------------------------------------------------------------
 from fingerprint import (get_peaks, process_song_database, match_audio_clip, 
                          plot_offset_histogram, plot_constellation_of_peaks, 
                          plot_spectrogram, store_song_fingerprints)
 
-#configuring UI
 st.set_page_config(page_title="EE200: Audio Fingerprinting", layout="wide", initial_sidebar_state="collapsed")
 st.title("Zapptain America: Audio Fingerprinting")
 st.markdown("#SIGNALS, SYSTEMS & NETWORKS Project")
-st.markdown("This app is a mini version of the famous Shazaam App . It takes a song and from the user and finds its constellations peaks and matches with a song present in out database and gives it's name")
+st.markdown("This app is a mini version of the famous Shazam App. It takes a song from the user, finds its constellation peaks, matches them with a song present in our database, and gives its name.")
 
 # Create the top-level navigation tabs
 tab_lib, tab_identify, tab_batch = st.tabs([" LIBRARY", " IDENTIFY", " BATCH"])
 
-#DataBase Management
+# -------------------------------------------------------------------------
+# 3. LIBRARY MANAGEMENT (WITH PERSISTENT UPLOADS)
+# -------------------------------------------------------------------------
 with tab_lib:
     st.markdown("### Library Management")
-    # Add a new song button
     st.markdown("####  Add a New Song :-")
     st.markdown("Upload a full track to add it permanently to the database.")
     uploaded_lib_file = st.file_uploader("Upload a song (.wav, .mp3, .flac)", type=["wav", "mp3", "flac"], key="lib_upload")
-    target_folder = "EE200 Project Song Database"
-    db_name_default = "song_database.db"
+    
     if uploaded_lib_file is not None:
         if st.button("Index Uploaded Song", type="primary"):
-            with st.spinner(f"Analyzing and indexing '{uploaded_lib_file.name}'..."):
-                os.makedirs(target_folder, exist_ok=True)# Ensures the directory exists
-                file_path = os.path.join(target_folder, uploaded_lib_file.name) # Save the file permanently to the folder
-                with open(file_path, "wb") as f:
-                    f.write(uploaded_lib_file.getbuffer())
-                song_name = uploaded_lib_file.name.rsplit('.', 1)[0]# Extract peaks and generate hashes
-                WINDOW_SIZE = 4096
-                HOP_LENGTH = WINDOW_SIZE // 4
-                _, times, freqs, _ = get_peaks(file_path, WINDOW_SIZE, HOP_LENGTH)
-                conn = sqlite3.connect(db_name_default)# Insert directly into the database
-                num_hashes = store_song_fingerprints(conn, times, freqs, song_name)
-                conn.close()
-                st.success(f"Successfully added '{song_name}', Generated {num_hashes} hashes.")
+            if not HF_TOKEN:
+                st.error("⚠️ HF_TOKEN secret is missing in Space Settings! Cannot save permanently.")
+            else:
+                with st.spinner(f"Analyzing, indexing, and uploading '{uploaded_lib_file.name}'..."):
+                    # A. Save the file locally to the active session workspace
+                    os.makedirs(target_folder, exist_ok=True)
+                    file_path = os.path.join(target_folder, uploaded_lib_file.name) 
+                    with open(file_path, "wb") as f:
+                        f.write(uploaded_lib_file.getbuffer())
+                    
+                    # B. Extract peaks and generate hashes in local database
+                    song_name = uploaded_lib_file.name.rsplit('.', 1)[0]
+                    WINDOW_SIZE = 4096
+                    HOP_LENGTH = WINDOW_SIZE // 4
+                    _, times, freqs, _ = get_peaks(file_path, WINDOW_SIZE, HOP_LENGTH)
+                    
+                    conn = sqlite3.connect(db_name_default)
+                    num_hashes = store_song_fingerprints(conn, times, freqs, song_name)
+                    conn.close()
+                    
+                    # C. PUSH CHANGES TO HUGGING FACE DATASET TO PREVENT WIPING OUT
+                    try:
+                        # 1. Upload the updated database file
+                        api.upload_file(
+                            path_or_fileobj=db_name_default,
+                            path_in_repo="song_database.db",
+                            repo_id=REPO_ID,
+                            repo_type="dataset"
+                        )
+                        
+                        # 2. Upload the newly added audio track
+                        # Saves it inside a subfolder matching your layout, change path_in_repo if needed
+                        api.upload_file(
+                            path_or_fileobj=file_path,
+                            path_in_repo=f"EE200 Project Song Database/{uploaded_lib_file.name}",
+                            repo_id=REPO_ID,
+                            repo_type="dataset"
+                        )
+                        
+                        st.success(f"Successfully added '{song_name}'! Generated {num_hashes} hashes and committed to Hugging Face Dataset.")
+                    except Exception as e:
+                        st.error(f"Failed to sync changes to Hugging Face: {e}")
 
     st.divider()
-    st.markdown("####  Current Database")#Viewing Database
-    # Query the database for all unique song names
+    st.markdown("####  Current Database")
+    
     try:
         conn = sqlite3.connect(db_name_default)
         cursor = conn.cursor()
@@ -57,13 +134,13 @@ with tab_lib:
         conn.close()
     except sqlite3.OperationalError:
         indexed_songs = []
+        
     if not indexed_songs:
         st.info("The database is currently empty. Upload a song above to get started.")
     else:
         st.metric(label="Total Songs Indexed", value=len(indexed_songs))
-        selected_song = st.selectbox("Select a song to view its constellation peaks:", indexed_songs)# Dropdown to select and view a specific song
+        selected_song = st.selectbox("Select a song to view its constellation peaks:", indexed_songs)
         if selected_song:
-            # Locate the original audio file in the folder to extract its visual peaks
             folder_path = Path(target_folder)
             matching_files = list(folder_path.glob(f"{selected_song}.*"))
             if matching_files:
@@ -76,14 +153,15 @@ with tab_lib:
                     if fig:
                         st.pyplot(fig)
             else:
-                st.warning(f"Audio file for '{selected_song}' is missing from the '{target_folder}' folder. The hashes exist in the database, but the original audio is required to draw the visual constellation.")
+                st.warning(f"Audio file for '{selected_song}' is missing from the working folder.")
+
+# ... [Keep your existing 'Identify a clip' and 'Identify many clips at once' code down here] ...
 
 #Single Clip Mode
 with tab_identify:
     st.markdown("### Identify a clip")
     uploaded_file = st.file_uploader("Upload a  clip", type=["wav", "mp3", "flac", "ogg", "m4a"], key="single_upload")
     # We need a default db_name for the identify and batch tabs
-    db_name_default = "song_database.db"
     if uploaded_file is not None:
         temp_clip_path = f"temp_query.{uploaded_file.name.split('.')[-1]}"
         with open(temp_clip_path, "wb") as f:
