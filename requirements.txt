@@ -1,0 +1,8 @@
+streamlit
+librosa
+numpy
+matplotlib
+scipy
+pandas
+soundfile
+huggingface_hub
